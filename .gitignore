@@ -1,0 +1,15 @@
+# Logs and snapshots written by preview_depth_kevin.py
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
