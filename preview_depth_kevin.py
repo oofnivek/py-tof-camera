@@ -37,7 +37,10 @@ dim = (width, height)
 # Field of view, used when the SDK doesn't report intrinsics (Arducam ToF spec values)
 HFOV = 64.3
 VFOV = 50.4
+CAMERA_HEIGHT = 90.0  # cm, camera mounting height above the ground
+GROUND_SEARCH = 10.0  # cm, look for the ground within this distance of CAMERA_HEIGHT below the camera
 OBJECT_MIN_HEIGHT = 1.5  # cm above the floor to count as part of the object
+TOP_FACE_TOLERANCE = 3.0  # cm below the top of the object still counted as its top face
 FLOOR_TOLERANCE = 2.0  # cm from the floor level to count as a floor point
 MAX_FLOOR_TILT = 15  # degrees allowed between the fitted floor and accelerometer up
 ACCEL_SMOOTHING = 0.3  # weight of the newest accelerometer reading (handheld jitter)
@@ -142,32 +145,36 @@ def camera_intrinsics(cam, info):
 
 
 def fit_floor(points, up):
-    """Return (n, d) so that n . p + d is a point's height above the floor, or None."""
+    """Return (n, d) so that n . p + d is a point's height above the ground.
+
+    The ground is measured by the ToF camera around CAMERA_HEIGHT below the camera;
+    if too little of it is visible, the configured height and accelerometer are used.
+    """
     heights = points @ up
-    bins = np.arange(heights.min(), heights.max() + 1.0, 1.0)
-    if len(bins) < 2:
-        return None
-    counts, edges = np.histogram(heights, bins)
+    window = np.arange(-CAMERA_HEIGHT - GROUND_SEARCH, -CAMERA_HEIGHT + GROUND_SEARCH + 1.0, 1.0)
+    counts, edges = np.histogram(heights, window)
 
-    # the floor is the lowest well-populated level; objects sit above it
-    floor_bin = np.argmax(counts >= 0.25 * counts.max())
-    floor_level = edges[floor_bin] + 0.5
-    floor_pts = points[np.abs(heights - floor_level) < FLOOR_TOLERANCE]
-    if len(floor_pts) < 50:
-        return None
+    if counts.max() >= 20:
+        # the ground is the lowest well-populated level; a box top sits above it
+        floor_bin = np.argmax(counts >= 0.25 * counts.max())
+        floor_pts = points[np.abs(heights - (edges[floor_bin] + 0.5)) < FLOOR_TOLERANCE]
 
-    centroid = floor_pts.mean(axis=0)
-    _, _, vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
-    n = vt[2]
-    if n @ up < 0:
-        n = -n
-    tilt = math.degrees(math.acos(min(1.0, n @ up)))
-    if tilt > MAX_FLOOR_TILT:
-        log.warning("Floor fit off by %.1f deg from accelerometer up, using accelerometer", tilt)
-        n = up  # fit landed on something else (e.g. a wall), trust the accelerometer
-    log.debug("Floor: %d points, normal=%s, tilt vs up=%.1f deg, camera height=%.1f cm",
-              len(floor_pts), np.round(n, 3), tilt, -n @ centroid)
-    return n, -n @ centroid
+        if len(floor_pts) >= 50:
+            centroid = floor_pts.mean(axis=0)
+            _, _, vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
+            n = vt[2]
+            if n @ up < 0:
+                n = -n
+            tilt = math.degrees(math.acos(min(1.0, n @ up)))
+            if tilt > MAX_FLOOR_TILT:
+                log.warning("Floor fit off by %.1f deg from accelerometer up, using accelerometer", tilt)
+                n = up  # fit landed on something else (e.g. a wall), trust the accelerometer
+            log.debug("Floor: %d points, normal=%s, tilt vs up=%.1f deg, camera height=%.1f cm",
+                      len(floor_pts), np.round(n, 3), tilt, -n @ centroid)
+            return n, -n @ centroid
+
+    log.warning("Ground not visible, using configured camera height %.0f cm", CAMERA_HEIGHT)
+    return up, CAMERA_HEIGHT
 
 
 def save_snapshot(reason, **data):
@@ -268,7 +275,7 @@ def main():
             label = ""
             floor = fit_floor(cloud[valid], up) if np.count_nonzero(valid) >= 50 else None
             if floor is None:
-                log.warning("Floor not found (%d valid pixels)", np.count_nonzero(valid))
+                log.warning("Too few valid pixels (%d)", np.count_nonzero(valid))
             else:
                 n, d = floor
                 height_map = cloud @ n + d
@@ -307,13 +314,17 @@ def main():
                     selected = (mask > 0) & valid & (height_map > OBJECT_MIN_HEIGHT)
 
                     if np.count_nonzero(selected) >= 20:
-                        object_height = np.percentile(height_map[selected], 98)
+                        # top face: the highest layer of the object; height is its level above the ground.
+                        # Taken from the uneroded mask: the height band already drops mixed edge pixels
+                        top = np.percentile(height_map[selected], 95)
+                        top_face = (object_mask > 0) & valid & (height_map > top - TOP_FACE_TOLERANCE)
+                        object_height = np.median(height_map[top_face])
 
-                        # footprint: object points projected onto the floor plane
+                        # length and width: top face projected onto the floor plane (top view)
                         e1 = np.cross(n, [1, 0, 0] if abs(n[0]) < 0.9 else [0, 1, 0])
                         e1 /= np.linalg.norm(e1)
                         e2 = np.cross(n, e1)
-                        pts = cloud[selected]
+                        pts = cloud[top_face]
                         footprint = np.column_stack((pts @ e1, pts @ e2)).astype(np.float32)
                         _, (side_a, side_b), _ = cv2.minAreaRect(footprint)
                         object_length, object_width = max(side_a, side_b), min(side_a, side_b)
