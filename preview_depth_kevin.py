@@ -7,6 +7,7 @@ import time
 import math
 import logging
 import os
+from collections import deque
 from datetime import datetime
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -43,7 +44,8 @@ OBJECT_MIN_HEIGHT = 1.5  # cm above the floor to count as part of the object
 TOP_FACE_TOLERANCE = 3.0  # cm below the top of the object still counted as its top face
 FLOOR_TOLERANCE = 2.0  # cm from the floor level to count as a floor point
 MAX_FLOOR_TILT = 15  # degrees allowed between the fitted floor and accelerometer up
-ACCEL_SMOOTHING = 0.3  # weight of the newest accelerometer reading (handheld jitter)
+ACCEL_SMOOTHING = 0.1  # weight of the newest accelerometer reading (camera is fixed, so smooth heavily)
+DEPTH_FRAMES = 5  # per-pixel median over this many frames to cut ToF noise (box and camera are still)
 DEPTH_EDGE_JUMP = 10.0  # cm, min depth step between neighbouring pixels that separates two surfaces
 DEPTH_EDGE_RATIO = 0.25  # the step also has to exceed this fraction of the depth (grazing faces step fast)
 
@@ -177,6 +179,17 @@ def fit_floor(points, up):
     return up, CAMERA_HEIGHT
 
 
+def median_depth(history):
+    """Per-pixel median of the valid readings in history (NaN = invalid); 0 where none are valid."""
+    stack = np.stack(history)
+    count = np.count_nonzero(~np.isnan(stack), axis=0)
+    ordered = np.sort(stack, axis=0)  # NaNs sort to the end
+    index = np.maximum((count - 1) // 2, 0)
+    median = np.take_along_axis(ordered, index[None], axis=0)[0]
+    median[count == 0] = 0
+    return median
+
+
 def save_snapshot(reason, **data):
     path = os.path.join(LOG_DIR, f"snapshot_{datetime.now():%Y%m%d_%H%M%S_%f}.npz")
     np.savez_compressed(path, **data)
@@ -214,6 +227,7 @@ def main():
     u, v = np.meshgrid(np.arange(info.width), np.arange(info.height))
     center_dist = (u - info.width / 2) ** 2 + (v - info.height / 2) ** 2
     up = None
+    depth_history = deque(maxlen=DEPTH_FRAMES)
 
     window_name = "Segmented RGB Image"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
@@ -260,17 +274,21 @@ def main():
                 up /= np.linalg.norm(up)
             log.debug("Accel raw=(%d, %d, %d) up=%s", xAccl, yAccl, zAccl, np.round(up, 3))
 
+            frame_valid = (depth_buf > 0) & (depth_buf < MAX_DISTANCE * 1000) & (confidence_buf >= confidence_value)
+            depth_history.append(np.where(frame_valid, depth_buf, np.nan).astype(np.float32))
+            depth_mm = median_depth(depth_history)
+
             # copies, since the SDK buffers are reused after releaseFrame
             last_frame.update(
-                depth=depth_buf.copy(), confidence=confidence_buf.copy(),
+                depth=depth_mm, depth_raw=depth_buf.copy(), confidence=confidence_buf.copy(),
                 accel=np.array([xAccl, yAccl, zAccl]), up=up.copy(),
                 intrinsics=np.array([fx, fy, cx, cy]), confidence_value=confidence_value,
             )
 
             # 3D point (cm) for every pixel, camera frame X right, Y down, Z forward
-            depth_cm = depth_buf / 10
+            depth_cm = depth_mm / 10
             cloud = np.dstack(((u - cx) * depth_cm / fx, (v - cy) * depth_cm / fy, depth_cm))
-            valid = (depth_buf > 0) & (depth_buf < MAX_DISTANCE * 1000) & (confidence_buf >= confidence_value)
+            valid = depth_mm > 0
 
             label = ""
             floor = fit_floor(cloud[valid], up) if np.count_nonzero(valid) >= 50 else None
