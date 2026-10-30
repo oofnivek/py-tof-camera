@@ -41,6 +41,8 @@ OBJECT_MIN_HEIGHT = 1.5  # cm above the floor to count as part of the object
 FLOOR_TOLERANCE = 2.0  # cm from the floor level to count as a floor point
 MAX_FLOOR_TILT = 15  # degrees allowed between the fitted floor and accelerometer up
 ACCEL_SMOOTHING = 0.3  # weight of the newest accelerometer reading (handheld jitter)
+DEPTH_EDGE_JUMP = 10.0  # cm, min depth step between neighbouring pixels that separates two surfaces
+DEPTH_EDGE_RATIO = 0.25  # the step also has to exceed this fraction of the depth (grazing faces step fast)
 
 class UserRect:
     def __init__(self) -> None:
@@ -203,7 +205,7 @@ def main():
     fx, fy, cx, cy = camera_intrinsics(cam, info)
     log.info(f"Intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
     u, v = np.meshgrid(np.arange(info.width), np.arange(info.height))
-    image_center = (info.width / 2, info.height / 2)
+    center_dist = (u - info.width / 2) ** 2 + (v - info.height / 2) ** 2
     up = None
 
     window_name = "Segmented RGB Image"
@@ -271,14 +273,26 @@ def main():
                 n, d = floor
                 height_map = cloud @ n + d
 
-                obj_mask = (valid & (height_map > OBJECT_MIN_HEIGHT)).astype(np.uint8) * 255
-                obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-                contours, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                contours = [c for c in contours if cv2.contourArea(c) >= 30]
+                # cut along depth jumps so the object doesn't merge with the background behind it
+                kernel = np.ones((3, 3), np.uint8)
+                depth_valid = np.where(valid, depth_cm, 0).astype(np.float32)
+                local_range = cv2.dilate(depth_valid, kernel) - cv2.erode(depth_valid, kernel)
+                depth_edges = local_range > np.maximum(DEPTH_EDGE_JUMP, DEPTH_EDGE_RATIO * depth_cm)
 
-                if contours:
-                    # the object being aimed at: the blob containing (or nearest) the image center
-                    max_contour = max(contours, key=lambda c: cv2.pointPolygonTest(c, image_center, True))
+                obj_mask = (valid & (height_map > OBJECT_MIN_HEIGHT) & ~depth_edges).astype(np.uint8) * 255
+                obj_mask = cv2.morphologyEx(obj_mask, cv2.MORPH_OPEN, kernel)
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(obj_mask, connectivity=4)
+                big = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= 30)
+                big = big[big != 0]  # label 0 is the background
+
+                if big.size:
+                    # the object being aimed at: the blob under (or nearest) the image center
+                    candidates = np.isin(labels, big)
+                    nearest = np.argmin(np.where(candidates, center_dist, np.inf))
+                    object_label = labels.flat[nearest]
+                    object_mask = (labels == object_label).astype(np.uint8) * 255
+                    contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    max_contour = max(contours, key=cv2.contourArea)
                     cv2.drawContours(result_image, [max_contour], -1, (0, 255, 0), 2)
 
                     x, y, w, l = cv2.boundingRect(max_contour)
@@ -289,9 +303,7 @@ def main():
                     log.info("Position: %d %d", center_x, center_y)
 
                     # object pixels, eroded to drop edge/flying pixels
-                    mask = np.zeros(depth_buf.shape, np.uint8)
-                    cv2.drawContours(mask, [max_contour], -1, 255, cv2.FILLED)
-                    mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
+                    mask = cv2.erode(object_mask, kernel)
                     selected = (mask > 0) & valid & (height_map > OBJECT_MIN_HEIGHT)
 
                     if np.count_nonzero(selected) >= 20:
