@@ -46,6 +46,7 @@ FLOOR_TOLERANCE = 2.0  # cm from the floor level to count as a floor point
 MAX_FLOOR_TILT = 15  # degrees allowed between the fitted floor and accelerometer up
 ACCEL_SMOOTHING = 0.1  # weight of the newest accelerometer reading (camera is fixed, so smooth heavily)
 DEPTH_FRAMES = 5  # per-pixel median over this many frames to cut ToF noise (box and camera are still)
+HEIGHT_COLOR_MAX = 60.0  # cm, height shown as the top (yellow) of the preview colour scale
 DEPTH_EDGE_JUMP = 10.0  # cm, min depth step between neighbouring pixels that separates two surfaces
 DEPTH_EDGE_RATIO = 0.25  # the step also has to exceed this fraction of the depth (grazing faces step fast)
 
@@ -127,8 +128,9 @@ def read_accel_axis(reg):
 
 def accel_to_camera_up(xAccl, yAccl, zAccl):
     # ADXL345 axes in the camera frame (X right, Y down, Z forward):
-    # x = image up, y = image left, z = out the back of the camera
-    up = np.array([-yAccl, -xAccl, -zAccl], dtype=np.float64)
+    # x = image up, y = image right, z = forward along the lens (confirmed on the fixed
+    # 90 cm mount: tilted down at the box gives x > 0, z < 0)
+    up = np.array([yAccl, -xAccl, zAccl], dtype=np.float64)
     return up / np.linalg.norm(up)
 
 
@@ -297,6 +299,13 @@ def main():
             else:
                 n, d = floor
                 height_map = cloud @ n + d
+
+                # preview: ground in grey, anything above it coloured by height (red low -> yellow high)
+                above = valid & (height_map > OBJECT_MIN_HEIGHT)
+                height_u8 = (np.clip(height_map / HEIGHT_COLOR_MAX, 0, 1) * 255).astype(np.uint8)
+                result_image = np.zeros((*depth_mm.shape, 3), np.uint8)
+                result_image[valid] = (128, 128, 128)
+                result_image[above] = cv2.applyColorMap(height_u8, cv2.COLORMAP_AUTUMN)[above]
 
                 # cut along depth jumps so the object doesn't merge with the background behind it
                 kernel = np.ones((3, 3), np.uint8)
