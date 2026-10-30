@@ -38,12 +38,15 @@ dim = (width, height)
 # Field of view, used when the SDK doesn't report intrinsics (Arducam ToF spec values)
 HFOV = 64.3
 VFOV = 50.4
+RADIAL_DEPTH = True  # depth is distance along each pixel's ray, not along the lens axis
 CAMERA_HEIGHT = 90.0  # cm, camera mounting height above the ground
-GROUND_SEARCH = 10.0  # cm, look for the ground within this distance of CAMERA_HEIGHT below the camera
-OBJECT_MIN_HEIGHT = 1.5  # cm above the floor to count as part of the object
+GROUND_SEARCH = 30.0  # cm, look for the ground within this distance of CAMERA_HEIGHT below the camera
+OBJECT_MIN_HEIGHT = 5.0  # cm above the floor to count as part of the object (above floor noise)
 TOP_FACE_TOLERANCE = 3.0  # cm below the top of the object still counted as its top face
-FLOOR_TOLERANCE = 2.0  # cm from the floor level to count as a floor point
-MAX_FLOOR_TILT = 15  # degrees allowed between the fitted floor and accelerometer up
+FLOOR_TOLERANCE = 2.0  # cm from the floor plane to count as a floor point
+MAX_FLOOR_TILT = 20  # degrees allowed between the fitted floor and accelerometer up (mounting offset)
+RANSAC_ITERATIONS = 200  # plane guesses tried when fitting the floor
+RANSAC_SAMPLE = 3000  # points used to score each guess
 ACCEL_SMOOTHING = 0.1  # weight of the newest accelerometer reading (camera is fixed, so smooth heavily)
 DEPTH_FRAMES = 5  # per-pixel median over this many frames to cut ToF noise (box and camera are still)
 HEIGHT_COLOR_MAX = 60.0  # cm, height shown as the top (yellow) of the preview colour scale
@@ -78,6 +81,7 @@ class UserRect:
 confidence_value = 15
 selectRect, followRect = UserRect(), UserRect()
 last_frame = {}  # raw inputs of the latest frame, saved as a snapshot on 's' or a crash
+rng = np.random.default_rng()
 
 
 def getPreviewRGB(preview: np.ndarray, confidence: np.ndarray) -> np.ndarray:
@@ -151,28 +155,39 @@ def camera_intrinsics(cam, info):
 def fit_floor(points, up):
     """Return (n, d) so that n . p + d is a point's height above the ground.
 
-    The ground is measured by the ToF camera around CAMERA_HEIGHT below the camera;
-    if too little of it is visible, the configured height and accelerometer are used.
+    The ground is the largest roughly level plane the ToF camera sees around CAMERA_HEIGHT
+    below the camera (RANSAC), so an accelerometer mounted a few degrees off the lens doesn't
+    matter. If too little of it is visible, the configured height and accelerometer are used.
     """
-    heights = points @ up
-    window = np.arange(-CAMERA_HEIGHT - GROUND_SEARCH, -CAMERA_HEIGHT + GROUND_SEARCH + 1.0, 1.0)
-    counts, edges = np.histogram(heights, window)
+    candidates = points[np.abs(points @ up + CAMERA_HEIGHT) < GROUND_SEARCH]
 
-    if counts.max() >= 20:
-        # the ground is the lowest well-populated level; a box top sits above it
-        floor_bin = np.argmax(counts >= 0.25 * counts.max())
-        floor_pts = points[np.abs(heights - (edges[floor_bin] + 0.5)) < FLOOR_TOLERANCE]
-
-        if len(floor_pts) >= 50:
-            centroid = floor_pts.mean(axis=0)
-            _, _, vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
-            n = vt[2]
+    if len(candidates) >= 50:
+        sample = candidates[rng.choice(len(candidates), min(RANSAC_SAMPLE, len(candidates)), replace=False)]
+        min_cos = math.cos(math.radians(MAX_FLOOR_TILT))
+        best_count, best_plane = 0, None
+        for _ in range(RANSAC_ITERATIONS):
+            p0, p1, p2 = sample[rng.choice(len(sample), 3, replace=False)]
+            n = np.cross(p1 - p0, p2 - p0)
+            norm = np.linalg.norm(n)
+            if norm < 1e-6:
+                continue
+            n /= norm
             if n @ up < 0:
                 n = -n
+            if n @ up < min_cos:
+                continue  # not level enough to be the ground (e.g. a box side)
+            count = np.count_nonzero(np.abs((sample - p0) @ n) < FLOOR_TOLERANCE)
+            if count > best_count:
+                best_count, best_plane = count, (n, -n @ p0)
+
+        if best_plane is not None:
+            # refine on every candidate near the best guess
+            n, d = best_plane
+            floor_pts = candidates[np.abs(candidates @ n + d) < FLOOR_TOLERANCE]
+            centroid = floor_pts.mean(axis=0)
+            _, _, vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
+            n = vt[2] if vt[2] @ up > 0 else -vt[2]
             tilt = math.degrees(math.acos(min(1.0, n @ up)))
-            if tilt > MAX_FLOOR_TILT:
-                log.warning("Floor fit off by %.1f deg from accelerometer up, using accelerometer", tilt)
-                n = up  # fit landed on something else (e.g. a wall), trust the accelerometer
             log.debug("Floor: %d points, normal=%s, tilt vs up=%.1f deg, camera height=%.1f cm",
                       len(floor_pts), np.round(n, 3), tilt, -n @ centroid)
             return n, -n @ centroid
@@ -227,6 +242,8 @@ def main():
     fx, fy, cx, cy = camera_intrinsics(cam, info)
     log.info(f"Intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
     u, v = np.meshgrid(np.arange(info.width), np.arange(info.height))
+    ray_x, ray_y = (u - cx) / fx, (v - cy) / fy  # each pixel's ray direction at Z = 1
+    ray_length = np.sqrt(1 + ray_x ** 2 + ray_y ** 2)
     center_dist = (u - info.width / 2) ** 2 + (v - info.height / 2) ** 2
     up = None
     depth_history = deque(maxlen=DEPTH_FRAMES)
@@ -289,7 +306,8 @@ def main():
 
             # 3D point (cm) for every pixel, camera frame X right, Y down, Z forward
             depth_cm = depth_mm / 10
-            cloud = np.dstack(((u - cx) * depth_cm / fx, (v - cy) * depth_cm / fy, depth_cm))
+            z_cm = depth_cm / ray_length if RADIAL_DEPTH else depth_cm
+            cloud = np.dstack((ray_x * z_cm, ray_y * z_cm, z_cm))
             valid = depth_mm > 0
 
             label = ""
